@@ -5,13 +5,19 @@ import re
 import os
 from difflib import SequenceMatcher
 
-# AI & NLP Stack
+# Machine Learning & AI Stack
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.cluster import KMeans
 from sklearn.ensemble import IsolationForest
-from transformers import pipeline  # Hugging Face Model Loader
 import plotly.express as px
 import plotly.graph_objects as go
+
+# Hugging Face Transformers
+try:
+    from transformers import pipeline
+except ImportError:
+    st.error("Missing libraries! Please add 'transformers' and 'torch' to your requirements.txt")
+    st.stop()
 
 # --- PAGE CONFIG ---
 st.set_page_config(page_title="AI Inventory Auditor Pro", layout="wide", page_icon="🛡️")
@@ -35,10 +41,10 @@ SPEC_TRAPS = {
     "Rating": ["150#", "300#", "600#", "PN10", "PN16", "PN25", "PN40"]
 }
 
-# --- AI MODELS LOADING (CACHED) ---
+# --- AI MODELS LOADING ---
 @st.cache_resource
 def load_hf_classifier():
-    # Using a fast, lightweight model for zero-shot classification
+    # Using a CPU-optimized, lightweight model for Zero-Shot Classification
     return pipeline("zero-shot-classification", model="typeform/distilbert-base-uncased-mnli")
 
 # --- AI UTILITIES ---
@@ -60,20 +66,6 @@ def get_tech_dna(text):
         if found: dna["attributes"][cat] = set(found)
     return dna
 
-def intelligent_noun_extractor(text):
-    text = clean_description(text)
-    phrases = ["MEASURING TAPE", "BALL VALVE", "GATE VALVE", "PLUG VALVE", "CHECK VALVE", "MECHANICAL SEAL", "PAINT BRUSH", "WIRE STRIPPER", "CUTTING PLIER", "DRILL BIT"]
-    for p in phrases:
-        if re.search(token_pattern(p), text): return p
-    all_nouns = [item for sublist in PRODUCT_GROUPS.values() for item in sublist]
-    for n in all_nouns:
-        if re.search(token_pattern(n), text): return n
-    return text.split()[0] if text.split() else "MISC"
-
-def dominant_group(series):
-    counts = series.value_counts()
-    return counts.idxmax() if not counts.empty else "UNMAPPED"
-
 # --- MAIN ENGINE ---
 @st.cache_data
 def run_intelligent_audit(file_path):
@@ -83,35 +75,30 @@ def run_intelligent_audit(file_path):
     desc_col = next(c for c in df.columns if 'desc' in c.lower())
     
     df['Standard_Desc'] = df[desc_col].apply(clean_description)
-    df['Part_Noun'] = df['Standard_Desc'].apply(intelligent_noun_extractor)
     
-    # 1. HUGGING FACE CLASSIFICATION
+    # 1. HUGGING FACE CATEGORIZATION
     classifier = load_hf_classifier()
     candidate_labels = list(PRODUCT_GROUPS.keys())
     
-    # Process batch for speed
+    # Processing only a sample or specific batch if needed for speed
     results = classifier(df['Standard_Desc'].tolist(), candidate_labels=candidate_labels)
     df['Product_Group'] = [r['labels'][0] for r in results]
-    df['HF_Score'] = [r['scores'][0] for r in results]
+    df['AI_Confidence'] = [round(r['scores'][0], 4) for r in results]
 
-    # 2. NLP & Topic Modeling
+    # 2. VECTORIZATION & CLUSTERING
     tfidf = TfidfVectorizer(max_features=300, stop_words='english')
     tfidf_matrix = tfidf.fit_transform(df['Standard_Desc'])
     
-    # 3. Clustering & Confidence
     kmeans = KMeans(n_clusters=8, random_state=42, n_init=10)
     df['Cluster_ID'] = kmeans.fit_predict(tfidf_matrix)
     dists = kmeans.transform(tfidf_matrix)
-    df['Confidence'] = (1 - (np.min(dists, axis=1) / np.max(dists, axis=1))).round(4)
-    cluster_groups = df.groupby('Cluster_ID')['Product_Group'].agg(dominant_group)
-    df['Cluster_Group'] = df['Cluster_ID'].map(cluster_groups)
-    df['Cluster_Validated'] = df['Product_Group'] == df['Cluster_Group']
-    
-    # 4. Anomaly detection
+    df['Distance_Score'] = np.min(dists, axis=1)
+
+    # 3. ANOMALY DETECTION
     iso = IsolationForest(contamination=0.04, random_state=42)
     df['Anomaly_Flag'] = iso.fit_predict(tfidf_matrix)
 
-    # 5. Fuzzy DNA
+    # 4. TECH DNA
     df['Tech_DNA'] = df['Standard_Desc'].apply(get_tech_dna)
     
     return df, id_col, desc_col
@@ -121,80 +108,57 @@ target_file = 'raw_data.csv'
 if os.path.exists(target_file):
     df_raw, id_col, desc_col = run_intelligent_audit(target_file)
 else:
-    st.error("Data file missing from repository. Please ensure 'raw_data.csv' is present.")
+    st.error("raw_data.csv not found!")
     st.stop()
 
-# --- HEADER & NAVIGATION ---
+# --- TABS ---
 st.title("🛡️ AI Inventory Auditor Pro")
-st.markdown("### Powered by Hugging Face Transformers")
+tabs = st.tabs(["📈 Executive Dashboard", "📍 AI Categorization", "🚨 Quality Hub", "🧠 Methodology"])
 
-page = st.tabs(["📈 Executive Dashboard", "📍 Categorization Audit", "🚨 Quality Hub", "🧠 Technical Methodology"])
+with tabs[0]:
+    st.header("Inventory Data Health")
+    kpi1, kpi2, kpi3 = st.columns(3)
+    kpi1.metric("SKUs Analyzed", len(df_raw))
+    kpi2.metric("Avg AI Confidence", f"{df_raw['AI_Confidence'].mean():.1%}")
+    kpi3.metric("Pattern Anomalies", len(df_raw[df_raw['Anomaly_Flag'] == -1]))
 
-df = df_raw.copy()
-group_options = list(PRODUCT_GROUPS.keys())
+    # Distribution Chart
+    fig_pie = px.pie(df_raw, names='Product_Group', title="Categorization Distribution", hole=0.4)
+    st.plotly_chart(fig_pie, use_container_width=True)
 
-# --- PAGE: EXECUTIVE DASHBOARD ---
-with page[0]:
-    st.markdown("#### 📊 Inventory Health Overview")
-    selected_group = st.multiselect("Product Category", options=group_options, default=group_options, key="dash_group")
-    df = df_raw[df_raw['Product_Group'].isin(selected_group)]
-    
-    kpi1, kpi2, kpi3, kpi4 = st.columns(4)
-    kpi1.metric("📦 SKUs Analyzed", len(df))
-    kpi2.metric("🎯 Mean AI Confidence", f"{df['HF_Score'].mean():.1%}")
-    kpi3.metric("⚠️ Anomalies Found", len(df[df['Anomaly_Flag'] == -1]))
-    kpi4.metric("🔄 Duplicate Pairs", "Audit Required")
+with tabs[1]:
+    st.header("Semantic Classification Details")
+    with st.expander("Why Hugging Face?"):
+        st.write("Traditional keyword matching fails when a 'Stripper' is mentioned without the word 'Tool'. Hugging Face understands the **meaning** (semantics) of the words to bucket them correctly.")
+    st.dataframe(df_raw[[id_col, 'Standard_Desc', 'Product_Group', 'AI_Confidence']])
 
+with tabs[2]:
+    st.header("Quality & Risk Identification")
     col1, col2 = st.columns(2)
+    
     with col1:
-        st.plotly_chart(px.pie(df, names='Product_Group', title="Categorization Split", hole=0.4), use_container_width=True)
+        st.subheader("⚠️ Anomalies")
+        anoms = df_raw[df_raw['Anomaly_Flag'] == -1]
+        st.dataframe(anoms[[id_col, 'Standard_Desc']])
+    
     with col2:
-        top_nouns = df['Part_Noun'].value_counts().head(10).reset_index()
-        st.plotly_chart(px.bar(top_nouns, x='Part_Noun', y='count', title="Top 10 Product Types"), use_container_width=True)
-
-    health_val = (len(df[df['Anomaly_Flag'] == 1]) / len(df)) * 100
-    fig_gauge = go.Figure(go.Indicator(mode = "gauge+number", value = health_val, title = {'text': "Catalog Data Accuracy %"}))
-    st.plotly_chart(fig_gauge, use_container_width=True)
-
-# --- PAGE: CATEGORIZATION AUDIT ---
-with page[1]:
-    st.markdown("#### 📍 AI Categorization Audit")
-    selected_group = st.multiselect("Product Category", options=group_options, default=group_options, key="cat_group")
-    df = df_raw[df_raw['Product_Group'].isin(selected_group)]
-    
-    st.dataframe(df[[id_col, 'Standard_Desc', 'Part_Noun', 'Product_Group', 'HF_Score']].sort_values('HF_Score', ascending=False), use_container_width=True)
-
-# --- PAGE: QUALITY HUB ---
-with page[2]:
-    st.markdown("#### 🚨 Anomaly & Duplicate Identification")
-    selected_group = st.multiselect("Product Category", options=group_options, default=group_options, key="qual_group")
-    df = df_raw[df_raw['Product_Group'].isin(selected_group)]
-    
-    t1, t2 = st.tabs(["⚠️ Anomalies", "👯 Fuzzy Duplicates"])
-    
-    with t1:
-        anoms = df[df['Anomaly_Flag'] == -1]
-        st.warning(f"Found {len(anoms)} anomalies.")
-        st.dataframe(anoms[[id_col, 'Standard_Desc', 'Part_Noun']], use_container_width=True)
-        
-    with t2:
+        st.subheader("👯 Fuzzy Match (Spec-Aware)")
+        # Simple fuzzy duplicate logic
         fuzzy_list = []
-        recs = df.to_dict('records')
+        recs = df_raw.head(100).to_dict('records') # Optimized for demo speed
         for i in range(len(recs)):
-            for j in range(i + 1, min(i + 50, len(recs))):
-                r1, r2 = recs[i], recs[j]
-                sim = SequenceMatcher(None, r1['Standard_Desc'], r2['Standard_Desc']).ratio()
+            for j in range(i + 1, len(recs)):
+                sim = SequenceMatcher(None, recs[i]['Standard_Desc'], recs[j]['Standard_Desc']).ratio()
                 if sim > 0.85:
-                    dna1, dna2 = r1['Tech_DNA'], r2['Tech_DNA']
-                    is_variant = (dna1['numbers'] != dna2['numbers']) or (dna1['attributes'] != dna2['attributes'])
-                    fuzzy_list.append({'ID A': r1[id_col], 'ID B': r2[id_col], 'Match %': f"{sim:.1%}", 'Verdict': "🛠️ Variant" if is_variant else "🚨 Duplicate"})
-        st.dataframe(pd.DataFrame(fuzzy_list), use_container_width=True)
+                    dna1, dna2 = recs[i]['Tech_DNA'], recs[j]['Tech_DNA']
+                    conflict = dna1['numbers'] != dna2['numbers']
+                    fuzzy_list.append({'A': recs[i][id_col], 'B': recs[j][id_col], 'Match': f"{sim:.1%}", 'Status': "Variant" if conflict else "Duplicate"})
+        st.dataframe(pd.DataFrame(fuzzy_list))
 
-# --- PAGE: METHODOLOGY ---
-with page[3]:
-    st.header("🧠 Technical Methodology")
+with tabs[3]:
+    st.header("The AI Engine Breakdown")
     st.markdown("""
-    1. **Hugging Face Zero-Shot Classification**: We use the `distilbert-base-uncased-mnli` model to semantically categorize items into your predefined `PRODUCT_GROUPS`. Unlike keyword matching, this understands synonyms and technical context.
-    2. **Isolation Forest**: Analyzes the complexity and length of descriptions to identify statistical anomalies.
-    3. **Spec-Aware Fuzzy Matching**: Uses Levenshtein distance but overrides the AI if the Technical DNA (numbers/gender) differs, preventing false-positive duplicates.
+    - **Zero-Shot Classification**: DistilBERT model trained on MNLI dataset to infer category relationships without specific training on your data.
+    - **TF-IDF & K-Means**: Numerical vectorization and clustering to identify semantic neighborhoods.
+    - **Isolation Forest**: Analyzes the structure of descriptions to isolate 'outlier' data entries.
     """)
