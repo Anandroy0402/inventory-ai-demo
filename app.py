@@ -85,6 +85,7 @@ def get_zero_shot_classifier():
     try:
         return pipeline("zero-shot-classification", model="facebook/bart-large-mnli")
     except Exception:
+        st.warning("Hugging Face classifier unavailable; using existing categories.")
         return None
 
 @st.cache_resource
@@ -92,18 +93,22 @@ def get_sentence_model():
     try:
         return SentenceTransformer("all-MiniLM-L6-v2")
     except Exception:
+        st.warning("Sentence-transformer model unavailable; falling back to TF-IDF signals.")
         return None
 
 def run_hf_zero_shot(texts, labels):
     classifier = get_zero_shot_classifier()
     if not classifier:
         return None
+    if isinstance(texts, str):
+        texts = [texts]
     try:
         results = classifier(texts, candidate_labels=labels)
         if isinstance(results, dict):
             results = [results]
         return results
     except Exception:
+        st.warning("Hugging Face classification failed; using existing categories.")
         return None
 
 def compute_embeddings(texts):
@@ -116,6 +121,7 @@ def compute_embeddings(texts):
         norms[norms == 0] = 1
         return embeddings / norms
     except Exception:
+        st.warning("Embedding generation failed; falling back to TF-IDF signals.")
         return None
 
 # --- MAIN ENGINE ---
@@ -162,7 +168,8 @@ def run_intelligent_audit(file_path):
         kmeans_hf = KMeans(n_clusters=8, random_state=42, n_init=10)
         df['HF_Cluster_ID'] = kmeans_hf.fit_predict(embeddings)
         hf_dists = kmeans_hf.transform(embeddings)
-        max_dist = np.maximum(np.max(hf_dists, axis=1), 1e-8)
+        max_dist = np.max(hf_dists, axis=1)
+        max_dist = np.where(max_dist == 0, 1e-8, max_dist)
         df['HF_Cluster_Confidence'] = (1 - (np.min(hf_dists, axis=1) / max_dist)).round(4)
         iso_hf = IsolationForest(contamination=0.04, random_state=42)
         df['HF_Anomaly_Flag'] = iso_hf.fit_predict(embeddings)
@@ -377,23 +384,25 @@ with page[2]:
             st.info("Semantic duplicate detection unavailable (HF embeddings not loaded).")
         else:
             sem_list = []
-            recs = df.reset_index(drop=True).to_dict('records')
-            embeddings = df['HF_Embedding'].tolist()
+            records = df.reset_index(drop=True)
+            recs = records.to_dict('records')
+            embeddings = records['HF_Embedding'].tolist()
             window_size = 50  # Keep comparisons lightweight for UI responsiveness.
-            for i in range(len(recs)):
-                for j in range(i + 1, min(i + window_size, len(recs))):
-                    emb_i, emb_j = embeddings[i], embeddings[j]
-                    if emb_i is None or emb_j is None:
-                        continue
-                    sim = float(np.dot(emb_i, emb_j))  # Cosine similarity on normalized embeddings.
-                    if sim > 0.9:
-                        sem_list.append({
-                            'ID A': recs[i][id_col],
-                            'ID B': recs[j][id_col],
-                            'Desc A': recs[i]['Standard_Desc'],
-                            'Desc B': recs[j]['Standard_Desc'],
-                            'Semantic Match %': f"{sim:.1%}"
-                        })
+            if any(e is None for e in embeddings):
+                st.info("Semantic duplicate detection unavailable (HF embeddings incomplete).")
+                sem_list = []
+            else:
+                for i in range(len(recs)):
+                    for j in range(i + 1, min(i + window_size, len(recs))):
+                        sim = float(np.dot(embeddings[i], embeddings[j]))  # Cosine similarity on normalized embeddings.
+                        if sim > 0.9:
+                            sem_list.append({
+                                'ID A': recs[i][id_col],
+                                'ID B': recs[j][id_col],
+                                'Desc A': recs[i]['Standard_Desc'],
+                                'Desc B': recs[j]['Standard_Desc'],
+                                'Semantic Match %': f"{sim:.1%}"
+                            })
             if sem_list:
                 st.dataframe(pd.DataFrame(sem_list), use_container_width=True, height=400)
             else:
