@@ -178,6 +178,7 @@ def compute_embeddings(texts):
             if not batch_embeddings:
                 return None
             if isinstance(batch_embeddings, list) and batch_embeddings and isinstance(batch_embeddings[0], (int, float)):
+                # Hugging Face returns a flat list for single inputs; wrap for consistent batching.
                 batch_embeddings = [batch_embeddings]
             embeddings.extend(batch_embeddings)
         embeddings = np.array(embeddings, dtype=float)
