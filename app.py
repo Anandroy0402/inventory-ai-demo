@@ -74,6 +74,10 @@ def map_product_group(noun):
                 return group
     return "UNMAPPED"
 
+def dominant_group(series):
+    counts = series.value_counts()
+    return counts.idxmax() if not counts.empty else "UNMAPPED"
+
 # --- MAIN ENGINE ---
 @st.cache_data
 def run_intelligent_audit(file_path):
@@ -97,10 +101,6 @@ def run_intelligent_audit(file_path):
     df['Cluster_ID'] = kmeans.fit_predict(tfidf_matrix)
     dists = kmeans.transform(tfidf_matrix)
     df['Confidence'] = (1 - (np.min(dists, axis=1) / np.max(dists, axis=1))).round(4)
-    def dominant_group(series):
-        counts = series.value_counts()
-        return counts.idxmax() if not counts.empty else "UNMAPPED"
-
     cluster_groups = df.groupby('Cluster_ID')['Product_Group'].agg(dominant_group)
     df['Cluster_Group'] = df['Cluster_ID'].map(cluster_groups)
     df['Cluster_Validated'] = df['Product_Group'] == df['Cluster_Group']
