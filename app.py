@@ -9,150 +9,194 @@ from sklearn.ensemble import IsolationForest
 import plotly.express as px
 
 # --- PAGE CONFIGURATION ---
-st.set_page_config(page_title="AI Inventory Manager", layout="wide")
+st.set_page_config(page_title="AI Inventory Manager", layout="wide", page_icon="📦")
 
-st.title("🚀 AI Inventory Intelligence Platform")
+# --- HEADER ---
+st.title("📦 AI Inventory Intelligence Platform")
 st.markdown("""
-**Status:** Running Cloud ETL & ML Pipeline...  
-**Source:** Reading `raw_data.csv` directly from repository.
+**System Status:** 🟢 Online  
+**Pipeline:** Cloud-Native ETL & ML  
+**Logic:** Strict Separation of *ID Validation* (Exact) and *Description Matching* (Fuzzy).
 """)
 
-# --- STEP 1: ETL & CLEANING (Cached for Performance) ---
+# --- ETL PIPELINE ---
 @st.cache_data
-def process_data(file_path):
+def load_and_process_data(file_path):
     # 1. Ingestion
     try:
-        # robust read to handle potential messy headers
         df = pd.read_csv(file_path, encoding='utf-8', on_bad_lines='skip')
-    except:
-        st.error("Could not read 'raw_data.csv'. Please check if it exists in the repo.")
-        return None, None
+    except Exception as e:
+        return None, f"Error reading file: {e}"
 
-    # Standardize Column Names
+    # 2. Smart Column Detection
     df.columns = [c.strip() for c in df.columns]
     
-    # Identify the description column dynamically
-    desc_col = None
-    for col in df.columns:
-        if df[col].dtype == object and df[col].str.len().mean() > 10:
-            desc_col = col
-            break
+    # Identify ID Column (Look for 'Item', 'No', 'ID', 'Code')
+    id_col = next((c for c in df.columns if any(x in c.lower() for x in ['item', 'no.', 'id', 'code'])), df.columns[0])
     
+    # Identify Description Column (Look for 'Desc', 'Name' or longest text column)
+    desc_col = next((c for c in df.columns if 'desc' in c.lower()), None)
     if not desc_col:
-        desc_col = df.columns[1] # Fallback
-    
-    # 2. Cleaning
+        # Fallback: Find column with longest average string length
+        text_cols = df.select_dtypes(include=['object'])
+        if not text_cols.empty:
+            desc_col = text_cols.apply(lambda x: x.str.len().mean()).idxmax()
+        else:
+            desc_col = df.columns[1]
+
+    # 3. Data Cleaning
     def clean_text(text):
-        text = str(text).lower()
-        text = re.sub(r'[^a-z0-9\s]', ' ', text) # Remove special chars
+        if not isinstance(text, str): return ""
+        text = text.lower()
+        text = re.sub(r'"+', '', text) # Remove quote artifacts
+        text = re.sub(r'[^a-z0-9\s./-]', ' ', text) # Keep alphanumeric + basic punctuation
         return re.sub(r'\s+', ' ', text).strip()
 
     df['Clean_Desc'] = df[desc_col].apply(clean_text)
 
-    # --- STEP 2: AI CATEGORIZATION (UNSUPERVISED) ---
-    # TF-IDF Vectorization
-    tfidf = TfidfVectorizer(max_features=500, stop_words='english')
-    tfidf_matrix = tfidf.fit_transform(df['Clean_Desc'])
+    # 4. AI Categorization (K-Means)
+    try:
+        tfidf = TfidfVectorizer(max_features=500, stop_words='english')
+        tfidf_matrix = tfidf.fit_transform(df['Clean_Desc'])
+        
+        kmeans = KMeans(n_clusters=6, random_state=42)
+        df['Cluster_ID'] = kmeans.fit_predict(tfidf_matrix)
+        
+        # Auto-Labeling
+        terms = tfidf.get_feature_names_out()
+        cluster_names = {}
+        for i in range(6):
+            center = kmeans.cluster_centers_[i]
+            top_terms = [terms[ind] for ind in center.argsort()[-3:]]
+            cluster_names[i] = " / ".join(top_terms).upper()
+        df['AI_Category'] = df['Cluster_ID'].map(cluster_names)
+    except:
+        df['AI_Category'] = "Uncategorized"
 
-    # K-Means Clustering
-    num_clusters = 6
-    kmeans = KMeans(n_clusters=num_clusters, random_state=42)
-    df['Cluster_ID'] = kmeans.fit_predict(tfidf_matrix)
-
-    # Auto-Labeling Clusters
-    terms = tfidf.get_feature_names_out()
-    cluster_names = {}
-    for i in range(num_clusters):
-        center = kmeans.cluster_centers_[i]
-        top_terms = [terms[ind] for ind in center.argsort()[-3:]]
-        cluster_names[i] = " / ".join(top_terms).upper()
-    
-    df['AI_Category'] = df['Cluster_ID'].map(cluster_names)
-    df['Confidence'] = np.random.uniform(0.88, 0.99, size=len(df)) # Simulated confidence for clustering distance
-
-    # --- STEP 3: ANOMALY DETECTION ---
-    # Feature Engineering
+    # 5. Anomaly Detection (Isolation Forest)
+    # Features: Description Length, Digit Count (Complexity)
     df['Desc_Len'] = df['Clean_Desc'].apply(len)
     df['Digit_Count'] = df['Clean_Desc'].apply(lambda x: len(re.findall(r'\d', x)))
     
-    # Isolation Forest
     iso = IsolationForest(contamination=0.05, random_state=42)
-    df['Is_Anomaly'] = iso.fit_predict(df[['Desc_Len', 'Digit_Count']])
-    df['Is_Anomaly'] = df['Is_Anomaly'].apply(lambda x: 'High Risk' if x == -1 else 'Normal')
+    df['Anomaly_Score'] = iso.fit_predict(df[['Desc_Len', 'Digit_Count']])
+    df['Is_Anomaly'] = df['Anomaly_Score'].apply(lambda x: 'High Risk' if x == -1 else 'Normal')
 
-    # --- STEP 4: DUPLICATE DETECTION ---
+    return df, id_col, desc_col
+
+# --- DUPLICATE LOGIC ---
+def run_duplicate_check(df, id_col, desc_col):
     duplicates = []
+    
+    # Check 1: Exact ID Duplicates (Critical Data Error)
+    exact_id_dups = df[df.duplicated(subset=[id_col], keep=False)]
+    if not exact_id_dups.empty:
+        for i, row in exact_id_dups.iterrows():
+             duplicates.append({
+                'Type': 'CRITICAL: Same ID',
+                'Item A': row[id_col],
+                'Item B': row[id_col],
+                'Description A': row[desc_col],
+                'Description B': 'SAME ID EXISTS TWICE',
+                'Score': '100%'
+            })
+
+    # Check 2: Fuzzy Description Matches (Potential SKU Merge)
+    # Optimization: Convert to list of dicts for speed
     records = df.to_dict('records')
-    # Limit check to first 500 to save cloud CPU time
-    limit = min(len(records), 500) 
+    limit = min(len(records), 600) # Cloud resource cap
     
     for i in range(limit):
         for j in range(i + 1, limit):
-            # Blocking: Only check if lengths are somewhat similar
-            if abs(len(records[i]['Clean_Desc']) - len(records[j]['Clean_Desc'])) > 10:
+            # Strict Rule: Only compare if IDs are DIFFERENT
+            if records[i][id_col] == records[j][id_col]:
+                continue
+                
+            # Heuristic Blocking: Skip if length difference is huge
+            if abs(len(records[i]['Clean_Desc']) - len(records[j]['Clean_Desc'])) > 8:
                 continue
             
+            # Levenshtein Ratio
             ratio = SequenceMatcher(None, records[i]['Clean_Desc'], records[j]['Clean_Desc']).ratio()
-            if ratio > 0.85:
+            
+            if ratio > 0.88: # Threshold (88% similarity)
                 duplicates.append({
-                    'Item A ID': records[i].get(df.columns[0], 'N/A'),
-                    'Item A Desc': records[i][desc_col],
-                    'Item B ID': records[j].get(df.columns[0], 'N/A'),
-                    'Item B Desc': records[j][desc_col],
-                    'Similarity Score': f"{ratio:.1%}"
+                    'Type': 'WARNING: Fuzzy Match',
+                    'Item A': records[i][id_col],
+                    'Item B': records[j][id_col],
+                    'Description A': records[i][desc_col],
+                    'Description B': records[j][desc_col],
+                    'Score': f"{ratio:.1%}"
                 })
+                
+    return pd.DataFrame(duplicates)
+
+# --- EXECUTION ---
+# Load Data directly from Repo
+file_path = 'raw_data.csv' 
+try:
+    df, id_col, desc_col = load_and_process_data(file_path)
+except:
+    st.warning("Data file 'raw_data.csv' not found in repository. Please upload it.")
+    st.stop()
+
+if isinstance(df, str): # Error catch
+    st.error(df)
+    st.stop()
+
+# Calculate Duplicates
+dups_df = run_duplicate_check(df, id_col, desc_col)
+
+# --- DASHBOARD UI ---
+
+# Top Metrics
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("Total SKU Count", len(df))
+m2.metric("Categories Identified", df['AI_Category'].nunique())
+m3.metric("Anomalies Flagged", len(df[df['Is_Anomaly']=='High Risk']))
+m4.metric("Duplicate Conflicts", len(dups_df))
+
+# Tabs
+tab1, tab2, tab3 = st.tabs(["📊 AI Categorization", "🚨 Anomaly Detection", "👯 Duplicate Manager"])
+
+with tab1:
+    st.subheader("Automated Inventory Clustering")
+    st.markdown("Items grouped by semantic similarity using **Unsupervised Learning (K-Means)**.")
     
-    return df, pd.DataFrame(duplicates)
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        # Bar Chart
+        chart_data = df['AI_Category'].value_counts().reset_index()
+        chart_data.columns = ['Category', 'Count']
+        fig = px.bar(chart_data, x='Count', y='Category', orientation='h', color='Count', title="Category Distribution")
+        st.plotly_chart(fig, use_container_width=True)
+    with col2:
+        st.dataframe(df[[id_col, desc_col, 'AI_Category']].head(100), height=400)
 
-# Run the pipeline
-df, dups_df = process_data('raw_data.csv')
-
-if df is not None:
-    # --- DASHBOARD UI ---
+with tab2:
+    st.subheader("Outlier Detection (Isolation Forest)")
+    st.markdown("These items deviate significantly from standard description patterns (Length/Complexity).")
     
-    # KPIs
-    st.info("✅ Pipeline Execution Successful. Data is processed live.")
-    kpi1, kpi2, kpi3, kpi4 = st.columns(4)
-    kpi1.metric("Items Processed", len(df))
-    kpi2.metric("Anomalies Found", len(df[df['Is_Anomaly']=='High Risk']))
-    kpi3.metric("Duplicate Pairs", len(dups_df))
-    kpi4.metric("Categories Created", df['AI_Category'].nunique())
+    anomalies = df[df['Is_Anomaly']=='High Risk']
+    st.dataframe(anomalies[[id_col, desc_col, 'Desc_Len', 'Digit_Count']], use_container_width=True)
+    
+    # Scatter Visual
+    fig2 = px.scatter(df, x='Desc_Len', y='Digit_Count', color='Is_Anomaly', 
+                      title="Anomaly Visualization: Description Length vs. Digit Count",
+                      color_discrete_map={'Normal':'#00CC96', 'High Risk':'#EF553B'},
+                      hover_data=[desc_col])
+    st.plotly_chart(fig2, use_container_width=True)
 
-    # Tabs
-    tab1, tab2, tab3 = st.tabs(["📊 Categorization & Clustering", "🚨 Anomaly Detection", "👯 Fuzzy Duplicates"])
-
-    with tab1:
-        st.subheader("AI-Driven Product Categorization")
-        st.caption("Categorization logic: TF-IDF Vectorization -> K-Means Clustering -> Auto-Labeling")
-        
-        col1, col2 = st.columns([2, 1])
-        with col1:
-            fig_cat = px.bar(df['AI_Category'].value_counts(), orientation='h', title="Category Distribution")
-            st.plotly_chart(fig_cat, use_container_width=True)
-        with col2:
-            st.dataframe(df[['Clean_Desc', 'AI_Category', 'Confidence']].head(100), height=400)
-
-    with tab2:
-        st.subheader("Outlier & Anomaly Detection")
-        st.caption("Detection logic: Isolation Forest (ML) analyzing description complexity and length.")
-        
-        anomalies = df[df['Is_Anomaly'] == 'High Risk']
-        st.error(f"⚠️ {len(anomalies)} items flagged as High Risk (Anomalies)")
-        
-        # Visualizing the anomalies
-        fig_anom = px.scatter(df, x='Desc_Len', y='Digit_Count', color='Is_Anomaly', 
-                              title="Anomaly Cluster Visualization", color_discrete_map={'Normal':'blue', 'High Risk':'red'},
-                              hover_data=['Clean_Desc'])
-        st.plotly_chart(fig_anom, use_container_width=True)
-        
-        st.write("### Detailed Anomaly Report")
-        st.dataframe(anomalies)
-
-    with tab3:
-        st.subheader("Fuzzy Duplicate Detection")
-        st.caption("Detection logic: Levenshtein Distance Algorithm (Threshold > 85%)")
-        
-        if not dups_df.empty:
-            st.dataframe(dups_df, use_container_width=True)
-        else:
-            st.success("No duplicates detected!")
+with tab3:
+    st.subheader("Inventory Conflict Resolution")
+    st.info(f"**Policy:** Exact ID matches are CRITICAL errors. Fuzzy description matches (different IDs) are WARNINGS.")
+    
+    if not dups_df.empty:
+        # Color code the dataframe based on Type
+        def highlight_type(val):
+            color = 'red' if 'CRITICAL' in val else 'orange'
+            return f'color: {color}; font-weight: bold'
+            
+        st.dataframe(dups_df.style.applymap(highlight_type, subset=['Type']), use_container_width=True)
+    else:
+        st.success("✅ Clean Data! No duplicates detected.")
