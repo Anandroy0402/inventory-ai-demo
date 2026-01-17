@@ -5,6 +5,8 @@ import re
 import os
 import json
 import socket
+import tomllib
+from pathlib import Path
 from difflib import SequenceMatcher
 from urllib import request, error
 
@@ -30,7 +32,7 @@ HF_ZERO_SHOT_MODEL = "facebook/bart-large-mnli"
 HF_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 HF_INFERENCE_API_URL = "https://api-inference.huggingface.co/models"
 HF_INFERENCE_TIMEOUT = 30
-ENABLE_HF_MODELS = os.getenv("ENABLE_HF_MODELS", "true").lower() == "true"
+ENABLE_HF_MODELS = os.getenv("ENABLE_HF_MODELS", "false").lower() == "true"
 HF_CONFIDENCE_MIN_THRESHOLD = 0.8
 HF_CONFIDENCE_MIN_TARGET = 0.6
 HF_CONFIDENCE_MAX_TARGET = 0.98
@@ -134,7 +136,20 @@ def build_fuzzy_duplicates(df, id_col):
                 })
     return fuzzy_list
 
+def get_streamlit_secrets():
+    secrets_path = Path(__file__).resolve().parent / ".streamlit" / "secrets.toml"
+    if not secrets_path.exists():
+        return {}
+    try:
+        with secrets_path.open("rb") as handle:
+            return tomllib.load(handle)
+    except (OSError, tomllib.TOMLDecodeError):
+        return {}
+
 def get_hf_secret(key):
+    secrets = get_streamlit_secrets()
+    if key in secrets:
+        return secrets[key]
     try:
         return st.secrets[key]
     except (AttributeError, KeyError):
