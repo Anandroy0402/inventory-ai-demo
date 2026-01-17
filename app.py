@@ -19,7 +19,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 
 # --- PAGE CONFIG ---
-st.set_page_config(page_title="AI Inventory Auditor Pro", layout="wide", page_icon="🛡️")
+st.set_page_config(page_title="AI Inventory Auditor", layout="wide", page_icon="🛡️")
 
 # --- KNOWLEDGE BASE: DOMAIN LOGIC ---
 DEFAULT_PRODUCT_GROUP = "Consumables & General"
