@@ -34,6 +34,8 @@ ENABLE_HF_MODELS = os.getenv("ENABLE_HF_MODELS", "false").lower() == "true"
 HF_CONFIDENCE_MIN_THRESHOLD = 0.8
 HF_CONFIDENCE_MIN_TARGET = 0.6
 HF_CONFIDENCE_MAX_TARGET = 0.98
+HF_CONNECTION_CACHE_TTL = 30
+HF_CONNECTION_TEST_TEXT = "Inventory audit connection check."
 
 PRODUCT_GROUPS = {
     "Piping & Fittings": ["FLANGE", "PIPE", "ELBOW", "TEE", "UNION", "REDUCER", "BEND", "COUPLING", "NIPPLE", "BUSHING", "UPVC", "CPVC", "PVC"],
@@ -146,7 +148,7 @@ def get_hf_token():
         or get_hf_secret("HUGGINGFACEHUB_API_TOKEN")
     )
 
-def call_hf_inference(model, payload, token, warning_message):
+def call_hf_inference(model, payload, token, warning_message, show_warnings=True):
     if not token:
         return None
     data = json.dumps(payload).encode("utf-8")
@@ -159,7 +161,8 @@ def call_hf_inference(model, payload, token, warning_message):
         with request.urlopen(req, timeout=HF_INFERENCE_TIMEOUT) as response:
             result = json.loads(response.read().decode("utf-8"))
         if isinstance(result, dict) and result.get("error"):
-            st.warning(f"{warning_message} ({result.get('error')})")
+            if show_warnings:
+                st.warning(f"{warning_message} ({result.get('error')})")
             return None
         return result
     except (error.HTTPError, error.URLError, socket.timeout, ValueError) as exc:
@@ -171,7 +174,8 @@ def call_hf_inference(model, payload, token, warning_message):
             detail = "network error"
         else:
             detail = "invalid response"
-        st.warning(f"{warning_message} ({detail})")
+        if show_warnings:
+            st.warning(f"{warning_message} ({detail})")
         return None
 
 def run_hf_zero_shot(texts, labels):
@@ -239,9 +243,81 @@ def compute_embeddings(texts):
         st.warning("Embedding generation failed; falling back to TF-IDF signals.")
         return None
 
+def is_valid_zero_shot_item(item):
+    if not isinstance(item, dict):
+        return False
+    labels = item.get("labels")
+    scores = item.get("scores")
+    return isinstance(labels, list) and isinstance(scores, list) and bool(labels) and bool(scores)
+
+def is_valid_zero_shot_response(result):
+    if isinstance(result, dict):
+        return is_valid_zero_shot_item(result)
+    if isinstance(result, list) and result:
+        return all(is_valid_zero_shot_item(item) for item in result)
+    return False
+
+def is_valid_embedding_response(result):
+    if not isinstance(result, list) or not result:
+        return False
+    if all(isinstance(x, (int, float)) for x in result):
+        return True
+    if isinstance(result[0], list) and result[0]:
+        return all(isinstance(x, (int, float)) for x in result[0])
+    return False
+
+@st.cache_data(ttl=HF_CONNECTION_CACHE_TTL)
+def test_hf_inference_connection(enable_hf_models):
+    if not enable_hf_models:
+        return {"enabled": False, "zero_shot": False, "embeddings": False, "reason": "disabled"}
+    token = get_hf_token()
+    if not token:
+        return {"enabled": False, "zero_shot": False, "embeddings": False, "reason": "missing_token"}
+    test_text = HF_CONNECTION_TEST_TEXT
+    zero_shot_payload = {
+        "inputs": [test_text],
+        "parameters": {
+            "candidate_labels": list(PRODUCT_GROUPS.keys()),
+            "hypothesis_template": "This industrial inventory item is {}"
+        },
+        "options": {"wait_for_model": True}
+    }
+    zero_shot_result = call_hf_inference(
+        HF_ZERO_SHOT_MODEL,
+        zero_shot_payload,
+        token,
+        "Hugging Face connection test failed",
+        show_warnings=False
+    )
+    zero_shot_ok = is_valid_zero_shot_response(zero_shot_result)
+    embedding_payload = {"inputs": [test_text], "options": {"wait_for_model": True}}
+    embedding_result = call_hf_inference(
+        HF_EMBEDDING_MODEL,
+        embedding_payload,
+        token,
+        "Hugging Face embedding test failed",
+        show_warnings=False
+    )
+    embedding_ok = is_valid_embedding_response(embedding_result)
+    if zero_shot_ok and embedding_ok:
+        status = "full"
+    elif zero_shot_ok or embedding_ok:
+        status = "partial"
+    else:
+        status = "unavailable"
+    enabled = status in {"full", "partial"}
+    reason = None if enabled else "inference_test_failed"
+    return {
+        "enabled": enabled,
+        "zero_shot": zero_shot_ok,
+        "embeddings": embedding_ok,
+        "reason": reason,
+        "status": status
+    }
+
 # --- MAIN ENGINE ---
 @st.cache_data
-def run_intelligent_audit(file_path, enable_hf_models=False):
+def run_intelligent_audit(file_path, enable_hf_zero_shot=False, enable_hf_embeddings=False):
     df = pd.read_csv(file_path, encoding='latin1')
     df.columns = [c.strip() for c in df.columns]
     id_col = next(c for c in df.columns if any(x in c.lower() for x in ['item', 'no']))
@@ -269,7 +345,7 @@ def run_intelligent_audit(file_path, enable_hf_models=False):
     iso = IsolationForest(contamination=0.04, random_state=42)
     df['Anomaly_Flag'] = iso.fit_predict(tfidf_matrix) # Using tfidf for complexity-based anomalies
 
-    standard_desc = df['Standard_Desc'].tolist() if enable_hf_models else None
+    standard_desc = df['Standard_Desc'].tolist() if enable_hf_embeddings else None
     hf_inputs = (
         df['Part_Noun']
         .fillna('')
@@ -277,11 +353,11 @@ def run_intelligent_audit(file_path, enable_hf_models=False):
         .str.replace(r'\s+', ' ', regex=True)
         .str.strip()
         .tolist()
-        if enable_hf_models else None
+        if enable_hf_zero_shot else None
     )
 
     # Hugging Face Zero-Shot Classification
-    hf_results = run_hf_zero_shot(hf_inputs, list(PRODUCT_GROUPS.keys())) if enable_hf_models else None
+    hf_results = run_hf_zero_shot(hf_inputs, list(PRODUCT_GROUPS.keys())) if enable_hf_zero_shot else None
     if hf_results:
         df['HF_Product_Group'] = [res['labels'][0] for res in hf_results]
         df['HF_Product_Confidence'] = [round(res['scores'][0], 4) for res in hf_results]
@@ -291,7 +367,7 @@ def run_intelligent_audit(file_path, enable_hf_models=False):
     df['HF_Product_Confidence'] = normalize_confidence_scores(df['HF_Product_Confidence'])
 
     # Hugging Face Embeddings for Clustering/Anomaly
-    embeddings = compute_embeddings(standard_desc) if enable_hf_models else None
+    embeddings = compute_embeddings(standard_desc) if enable_hf_embeddings else None
     if embeddings is not None:
         kmeans_hf = KMeans(n_clusters=8, random_state=42, n_init=10)
         df['HF_Cluster_ID'] = kmeans_hf.fit_predict(embeddings)
@@ -313,9 +389,14 @@ def run_intelligent_audit(file_path, enable_hf_models=False):
     return df, id_col, desc_col
 
 # --- DATA LOADING ---
+hf_status = test_hf_inference_connection(ENABLE_HF_MODELS)
 target_file = 'raw_data.csv'
 if os.path.exists(target_file):
-    df_raw, id_col, desc_col = run_intelligent_audit(target_file, enable_hf_models=ENABLE_HF_MODELS)
+    df_raw, id_col, desc_col = run_intelligent_audit(
+        target_file,
+        enable_hf_zero_shot=hf_status["zero_shot"],
+        enable_hf_embeddings=hf_status["embeddings"]
+    )
 else:
     st.error("Data file missing from repository. Please ensure 'raw_data.csv' is present.")
     st.stop()
@@ -326,9 +407,26 @@ group_options = list(PRODUCT_GROUPS.keys())
 # --- HEADER & MODERN NAVIGATION ---
 st.title("🛡️ AI Inventory Auditor Pro")
 st.markdown("### Advanced Inventory Intelligence & Quality Management")
+if hf_status["enabled"]:
+    enabled_features = []
+    if hf_status["zero_shot"]:
+        enabled_features.append("zero-shot classification")
+    if hf_status["embeddings"]:
+        enabled_features.append("embeddings")
+    feature_label = ", ".join(enabled_features)
+    status_label = hf_status.get("status", "partial")
+    if status_label not in {"full", "partial"}:
+        status_label = "partial"
+    st.success(f"Hugging Face Inference API connected ({status_label}: {feature_label}).")
+elif hf_status["reason"] == "disabled":
+    st.info("Hugging Face models disabled. Set ENABLE_HF_MODELS=true to enable hosted inference.")
+elif hf_status["reason"] == "missing_token":
+    st.warning("Hugging Face token missing; using local signals instead of hosted inference.")
+else:
+    st.warning("Hugging Face Inference API connection test failed; using local signals instead.")
 
 # Modern horizontal tab navigation
-page = st.tabs(["📈 Executive Dashboard", "📍 Categorization Audit", "🚨 Quality Hub (Anomalies/Dups)", "🧠 Technical Methodology"])
+page = st.tabs(["📈 Executive Dashboard", "📍 Categorization Audit", "🚨 Quality Hub (Anomalies/Dups)", "🧠 Technical Methodology", "🧭 My Approach"])
 
 # --- PAGE: EXECUTIVE DASHBOARD ---
 with page[0]:
@@ -540,3 +638,62 @@ with page[3]:
     ### 5. Fuzzy Match & Conflict Resolution
     We use the **Levenshtein Distance** algorithm. However, we've added a **Business Logic Layer**: if two items have similar text but conflicting 'Technical DNA' (e.g. one is Male, one is Female), the system overrides the AI and flags it as a **Variant**, not a duplicate. We also run a semantic duplicate check using cosine similarity on sentence-transformer embeddings within a small window.
     """)
+
+# --- PAGE: MY APPROACH ---
+with page[4]:
+    st.markdown("#### 🧭 My Approach")
+    st.markdown("A concise walkthrough of the full end-to-end workflow implemented across the app.")
+    st.markdown("""
+    <h2>🏛️ Architectural Philosophy: The Hybrid Intelligence Model</h2>
+    <p>The core strength of this application lies in its <b>Hybrid AI Approach</b>. Rather than relying on a single algorithm, it combines three distinct layers of logic to ensure accuracy:</p>
+    <ol>
+        <li><p><b>Heuristic Layer:</b> Uses a predefined Knowledge Base and Regular Expressions (RegEx) for absolute technical accuracy.</p></li>
+        <li><p><b>Statistical Layer (Classical ML):</b> Employs <b>TF-IDF</b>, <b>K-Means</b>, and <b>Isolation Forest</b> for pattern recognition and anomaly detection based on the specific dataset.</p></li>
+        <li><p><b>Neural Layer (Deep Learning):</b> Leverages <b>Hugging Face Inference APIs</b> (BART and Sentence-Transformers) for semantic understanding and zero-shot classification.</p></li>
+    </ol>
+    <hr>
+    <h2>🛠️ Phase 1: Data Standardization &amp; "Tech DNA" Extraction</h2>
+    <p>The system first cleanses the data to remove "noise" (special characters, case inconsistencies) that typically disrupts auditing.</p>
+    <ul>
+        <li><p><b>Standardization:</b> The <code>clean_description</code> function normalizes descriptions (e.g., converting "O-RING" to "O RING" and "MECH-SEAL" to "MECHANICAL SEAL").</p></li>
+        <li><p><b>Feature Engineering (Tech DNA):</b> The <code>get_tech_dna</code> function is a specialized parser. It extracts "Genetic Markers" of an inventory item—specifically <b>numeric values</b> and <b>technical attributes</b> (Gender, Connection type, Pressure rating). This allows the AI to distinguish between a "Male Valve" and a "Female Valve" even if the text descriptions are 99% similar.</p></li>
+    </ul>
+    <hr>
+    <h2>🏷️ Phase 2: Multi-Stage Categorization</h2>
+    <p>To ensure items are placed in the correct <code>Product_Group</code>, the app runs a parallel classification process:</p>
+    <h3>1. Rule-Based Noun Extraction</h3>
+    <p>The <code>intelligent_noun_extractor</code> uses a prioritized list of phrases (e.g., "BALL VALVE" takes precedence over "VALVE") to identify the "Part Noun."</p>
+    <h3>2. Zero-Shot Classification (Deep Learning)</h3>
+    <p>If enabled, the system calls the <code>facebook/bart-large-mnli</code> model. Unlike traditional models, this does not require training on your specific data; it uses its pre-trained "knowledge" of the English language to categorize items into labels like "Fasteners &amp; Seals" or "Piping &amp; Fittings."</p>
+    <h3>3. Cluster Validation</h3>
+    <p>The system uses <b>K-Means Clustering</b> to group items that are mathematically similar. It then checks if the "Human Logic" category matches the "Machine Logic" cluster. If they match, the <b>Confidence Score</b> increases.</p>
+    <hr>
+    <h2>🚨 Phase 3: The Quality &amp; Audit Hub</h2>
+    <p>This is the engine's "Defense Layer," designed to catch errors that a human auditor might miss.</p>
+    <h3>Anomaly Detection (Isolation Forest)</h3>
+    <p>The <code>IsolationForest</code> algorithm treats the inventory list as a multi-dimensional map. Items that exist in "lonely" areas of this map (mathematical outliers) are flagged as anomalies. This is excellent for catching typos or items that simply don't belong in the catalog.</p>
+    <h3>Fuzzy vs. Semantic Duplicates</h3>
+    <ul>
+        <li><p><b>Fuzzy Matching:</b> Uses Levenshtein distance to find text-based similarities.</p></li>
+        <li><p><b>Semantic Matching:</b> Uses <b>Cosine Similarity</b> on high-dimensional vectors (Embeddings).</p></li>
+        <li><p><b>The "Spec-Trap" Override:</b> Crucially, if two items have a high similarity score but different "Tech DNA" (e.g., one is 150# rating and the other is 300#), the system overrides the duplicate flag and labels it a <b>Variant</b>.</p></li>
+    </ul>
+    <hr>
+    <h2>📈 Phase 4: Executive Insights (Streamlit UI)</h2>
+    <p>The final layer translates complex data into actionable metrics using <b>Plotly</b>:</p>
+    <ul>
+        <li><p><b>Inventory Health Gauge:</b> A real-time calculation of data accuracy.</p></li>
+        <li><p><b>Confidence Distribution:</b> A histogram showing the reliability of the AI's categorization.</p></li>
+        <li><p><b>Duplicate Pairs:</b> A structured list of potential risks for procurement and warehouse teams.</p></li>
+    </ul>
+    <hr>
+    <h2>🧰 Technical Stack Summary</h2>
+
+    | Component | Technology |
+    | - | - |
+    | Frontend | Streamlit |
+    | Data Processing | Pandas, NumPy, RegEx |
+    | Machine Learning | Scikit-Learn (KMeans, Isolation Forest) |
+    | Deep Learning | Hugging Face Inference API (BART, MiniLM) |
+    | Visualizations | Plotly Express &amp; Graph Objects |
+    """, unsafe_allow_html=True)
